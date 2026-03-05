@@ -1,6 +1,6 @@
-const REQUIRED_PUBLIC = ["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"] as const;
+type PublicEnvKey = "NEXT_PUBLIC_SUPABASE_URL" | "NEXT_PUBLIC_SUPABASE_ANON_KEY";
 
-export function getPublicEnv(name: (typeof REQUIRED_PUBLIC)[number]): string {
+export function getPublicEnv(name: PublicEnvKey): string {
   const value = process.env[name];
   if (!value) {
     throw new Error(`${name} is not set`);
