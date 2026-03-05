@@ -1,11 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createSupabaseServerClient } from "@/lib/supabase";
-import { slugify, uniqueSlug } from "@/lib/slug";
 
 const schema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
+  password: z.string().min(8).optional(),
   name: z.string().min(2),
   agencyName: z.string().min(2),
   phone: z.string().optional(),
@@ -15,63 +13,102 @@ const schema = z.object({
   brandVoice: z.string().optional()
 });
 
-async function generateAvailableSlug(supabase: ReturnType<typeof createSupabaseServerClient>, baseInput: string) {
-  const base = slugify(baseInput) || `agent-${Math.floor(Math.random() * 100000)}`;
+async function sendTelegram(text: string) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_NOTIFY_CHAT_ID;
+  if (!token || !chatId) return { ok: false, reason: "missing config" };
 
-  for (let i = 0; i < 50; i += 1) {
-    const candidate = uniqueSlug(base, i);
-    const { data } = await supabase.from("agents").select("slug").eq("slug", candidate).maybeSingle();
-    if (!data) return candidate;
-  }
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+  return { ok: res.ok };
+}
 
-  return `${base}-${Date.now()}`;
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
 }
 
 export async function POST(req: Request) {
   try {
     const body = schema.parse(await req.json());
-    const supabase = createSupabaseServerClient();
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email: body.email,
-      password: body.password
-    });
+    // --- Full mode (Supabase configured) ---
+    if (supabaseUrl) {
+      const { createSupabaseServerClient } = await import("@/lib/supabase");
+      const { slugify: slugifyLib, uniqueSlug } = await import("@/lib/slug");
+      const supabase = createSupabaseServerClient();
 
-    if (authError || !authData.user) {
-      return NextResponse.json({ error: authError?.message ?? "Signup failed" }, { status: 400 });
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: body.email,
+        password: body.password || "temppass123"
+      });
+
+      if (authError || !authData.user) {
+        return NextResponse.json({ error: authError?.message ?? "Signup failed" }, { status: 400 });
+      }
+
+      const base = slugifyLib(body.agencyName || body.name) || `agent-${Math.floor(Math.random() * 100000)}`;
+      let slug = base;
+      for (let i = 0; i < 50; i += 1) {
+        const candidate = uniqueSlug(base, i);
+        const { data } = await supabase.from("agents").select("slug").eq("slug", candidate).maybeSingle();
+        if (!data) { slug = candidate; break; }
+      }
+
+      const { error: agentError } = await supabase.from("agents").insert({
+        id: authData.user.id,
+        email: body.email,
+        name: body.name,
+        agency_name: body.agencyName,
+        phone: body.phone || null,
+        timezone: body.timezone,
+        insurance_types: body.insuranceTypes,
+        calendar_link: body.calendarLink || null,
+        brand_voice: body.brandVoice || null,
+        slug
+      });
+
+      if (agentError) {
+        return NextResponse.json({ error: agentError.message }, { status: 500 });
+      }
+
+      return NextResponse.json({
+        user: { id: authData.user.id, email: authData.user.email, slug }
+      });
     }
 
-    const slug = await generateAvailableSlug(supabase, body.agencyName || body.name);
+    // --- Demo mode (no Supabase) ---
+    const slug = slugify(body.agencyName || body.name) || `agent-${Date.now()}`;
 
-    const { error: agentError } = await supabase.from("agents").insert({
-      id: authData.user.id,
-      email: body.email,
-      name: body.name,
-      agency_name: body.agencyName,
-      phone: body.phone || null,
-      timezone: body.timezone,
-      insurance_types: body.insuranceTypes,
-      calendar_link: body.calendarLink || null,
-      brand_voice: body.brandVoice || null,
-      slug
-    });
+    const text = [
+      "NEW AGENT SIGNUP (LeadSpark)",
+      `Name: ${body.name}`,
+      `Agency: ${body.agencyName}`,
+      `Email: ${body.email}`,
+      `Phone: ${body.phone || "N/A"}`,
+      `Timezone: ${body.timezone}`,
+      `Insurance: ${body.insuranceTypes.join(", ")}`,
+      `Calendar: ${body.calendarLink || "N/A"}`,
+      `Slug: ${slug}`
+    ].join("\n");
 
-    if (agentError) {
-      return NextResponse.json({ error: agentError.message }, { status: 500 });
-    }
+    const telegram = await sendTelegram(text);
 
     return NextResponse.json({
-      user: {
-        id: authData.user.id,
-        email: authData.user.email,
-        slug
-      }
+      user: { id: `demo-${Date.now()}`, email: body.email, slug },
+      telegram
     });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: error.issues[0]?.message ?? "Invalid payload" }, { status: 400 });
     }
-
     return NextResponse.json({ error: "Unexpected error" }, { status: 500 });
   }
 }
